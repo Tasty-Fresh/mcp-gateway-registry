@@ -359,6 +359,266 @@ class TestGenerateVirtualBackendLocations:
         assert result == ""
 
 
+class TestGenerateVirtualBackendEgressLocations:
+    """Tests for egress-authed virtual backend locations (issue #1607).
+
+    A backend registered with gateway egress auth (oauth_user / pat /
+    obo_exchange) must NOT be proxied directly; it must route through the same
+    /validate + /mcp-proxy seam as a directly-registered server so the per-user
+    credential is vended/injected and the caller's gateway credential is stripped.
+    """
+
+    @pytest.mark.asyncio
+    async def test_egress_backend_routes_through_mcp_proxy(self, mock_server_repository):
+        """Egress backends proxy to the auth-server mcp_proxy hop, not the backend."""
+        vs = _make_vs_config()
+        mock_server_repository.get.return_value = {
+            "proxy_pass_url": "https://api.github.com",
+            "egress_auth_mode": "obo_exchange",
+        }
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_backend_locations([vs])
+
+        from registry.core.config import settings
+
+        mcp_proxy_target = f"{settings.auth_server_url.rstrip('/')}/mcp-proxy/github/"
+        # Routes through the mcp_proxy hop keyed on the resolved backend path ...
+        assert f"proxy_pass {mcp_proxy_target};" in result
+        # ... and never directly to the registrant-controlled backend.
+        assert "proxy_pass https://api.github.com/mcp;" not in result
+
+    @pytest.mark.asyncio
+    async def test_egress_backend_binds_resolved_upstream(self, mock_server_repository):
+        """The resolved backend upstream is bound into $backend_url (token upstream claim)."""
+        vs = _make_vs_config()
+        mock_server_repository.get.return_value = {
+            "proxy_pass_url": "https://api.github.com",
+            "egress_auth_mode": "obo_exchange",
+        }
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_backend_locations([vs])
+
+        assert 'set $backend_url "https://api.github.com/mcp";' in result
+
+    @pytest.mark.asyncio
+    async def test_egress_backend_binds_backend_server_path(self, mock_server_repository):
+        """The resolved backend server path is bound so /validate mints the right token."""
+        vs = _make_vs_config()
+        mock_server_repository.get.return_value = {
+            "proxy_pass_url": "https://api.github.com",
+            "egress_auth_mode": "obo_exchange",
+        }
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_backend_locations([vs])
+
+        assert 'set $vs_backend_server_name "github";' in result
+
+    @pytest.mark.asyncio
+    async def test_egress_backend_mints_backend_bound_token(self, mock_server_repository):
+        """The egress backend hop mints + forwards a backend-bound internal token.
+
+        auth_request does NOT run in ngx.location.capture subrequests, so the token
+        is minted by virtual_backend_mint.lua capturing the sibling validate
+        location, then forwarded to mcp_proxy via $auth_internal_token.
+        """
+        vs = _make_vs_config()
+        mock_server_repository.get.return_value = {
+            "proxy_pass_url": "https://api.github.com",
+            "egress_auth_mode": "obo_exchange",
+        }
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_backend_locations([vs])
+
+        # No auth_request (it is a no-op in a subrequest) ...
+        assert "auth_request /validate;" not in result
+        # ... instead the mint helper captures the sibling validate location ...
+        assert 'set $vs_validate_location "/_vs_validate_github";' in result
+        assert "rewrite_by_lua_file /etc/nginx/lua/virtual_backend_mint.lua;" in result
+        # ... and the minted token is forwarded to mcp_proxy.
+        assert 'set $auth_internal_token "";' in result
+        assert "proxy_set_header X-Internal-Token $auth_internal_token;" in result
+
+    @pytest.mark.asyncio
+    async def test_egress_backend_validate_uses_get_method(self, mock_server_repository):
+        """The minting validate location must proxy to /validate with GET (the
+        /validate contract), not forward the capture's POST.
+
+        virtual_backend_mint.lua captures the sibling validate location with
+        ngx.HTTP_POST; without proxy_method GET, that POST would reach auth-server
+        /validate and be rejected 405 Method Not Allowed.
+        """
+        vs = _make_vs_config()
+        mock_server_repository.get.return_value = {
+            "proxy_pass_url": "https://api.github.com",
+            "egress_auth_mode": "obo_exchange",
+        }
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_backend_locations([vs])
+
+        assert "proxy_method GET;" in result
+
+    @pytest.mark.asyncio
+    async def test_egress_backend_passes_identity_into_validate(self, mock_server_repository):
+        """The minting validate location forwards the backend identity + upstream to
+        auth-server /validate (so it authorizes + mints against the backend)."""
+        vs = _make_vs_config()
+        mock_server_repository.get.return_value = {
+            "proxy_pass_url": "https://api.github.com",
+            "egress_auth_mode": "obo_exchange",
+        }
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_backend_locations([vs])
+
+        from registry.core.config import settings
+
+        validate_target = f"{settings.auth_server_url.rstrip('/')}/validate"
+        assert "location /_vs_validate_github {" in result
+        assert f"proxy_pass {validate_target};" in result
+        assert "proxy_set_header X-Resolved-Upstream $backend_url;" in result
+        assert "proxy_set_header X-Vs-Backend-Server-Name $vs_backend_server_name;" in result
+        assert "proxy_set_header X-Validate-Source-Secret" in result
+
+    @pytest.mark.asyncio
+    async def test_egress_backend_captures_body_for_scope_check(self, mock_server_repository):
+        """The minting validate location captures the proxied body so /validate
+        authorizes the real backend-original tool, not the virtual alias."""
+        vs = _make_vs_config()
+        mock_server_repository.get.return_value = {
+            "proxy_pass_url": "https://api.github.com",
+            "egress_auth_mode": "obo_exchange",
+        }
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_backend_locations([vs])
+
+        assert "rewrite_by_lua_file /etc/nginx/lua/capture_body.lua;" in result
+
+    @pytest.mark.asyncio
+    async def test_egress_backend_does_not_leak_cookie(self, mock_server_repository):
+        """The caller's registry session cookie must never reach the backend."""
+        vs = _make_vs_config()
+        mock_server_repository.get.return_value = {
+            "proxy_pass_url": "https://api.github.com",
+            "egress_auth_mode": "obo_exchange",
+        }
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_backend_locations([vs])
+
+        assert 'proxy_set_header Cookie "";' in result
+
+    @pytest.mark.asyncio
+    async def test_non_egress_backend_keeps_direct_proxy(self, mock_server_repository):
+        """A backend without egress auth keeps the direct (no-mcp-proxy) path."""
+        vs = _make_vs_config()
+        mock_server_repository.get.return_value = {
+            "proxy_pass_url": "https://api.github.com",
+            "egress_auth_mode": "none",
+        }
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_backend_locations([vs])
+
+        assert "proxy_pass https://api.github.com/mcp;" in result
+        assert "mcp-proxy" not in result
+
+    @pytest.mark.asyncio
+    async def test_egress_backend_identity_not_client_derived(self, mock_server_repository):
+        """The backend identity + upstream are bound from trusted config, never from
+        client-supplied request headers (no $http_* passthrough)."""
+        vs = _make_vs_config()
+        mock_server_repository.get.return_value = {
+            "proxy_pass_url": "https://api.github.com",
+            "egress_auth_mode": "obo_exchange",
+        }
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_backend_locations([vs])
+
+        # Identity/upstream are `set` from registry-generated config, not read from
+        # any inbound header a caller could forge.
+        assert 'set $backend_url "https://api.github.com/mcp";' in result
+        assert 'set $vs_backend_server_name "github";' in result
+        assert "$http_x_vs_backend_server_name" not in result
+        assert "$http_x_resolved_upstream" not in result
+        assert "proxy_set_header X-Vs-Backend-Server-Name $http_" not in result
+
+    @pytest.mark.asyncio
+    async def test_parent_virtual_auth_stays_separate(self, mock_server_repository):
+        """The parent virtual /validate (server=virtual/...) stays a SEPARATE main-request
+        auth_request; the backend hop mints its OWN token via a dedicated validate
+        location rather than reusing/overriding the parent's auth_request."""
+        vs = _make_vs_config()
+        mock_server_repository.get.return_value = {
+            "proxy_pass_url": "https://api.github.com",
+            "egress_auth_mode": "obo_exchange",
+        }
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_backend_locations([vs])
+
+        # The backend hop never emits auth_request (which is main-request-only and
+        # would clobber the parent's server='virtual/...' authorization).
+        assert "auth_request /validate;" not in result
+        # It mints via its own dedicated validate location, keyed on the backend.
+        assert "location /_vs_validate_github {" in result
+        assert "location /_vs_backend_github {" in result
+
+    @pytest.mark.asyncio
+    async def test_egress_backend_federated_path_binding(self, mock_server_repository):
+        """Multi-segment federated backend paths are bound + proxied correctly."""
+        vs = _make_vs_config(
+            tool_mappings=[
+                ToolMapping(tool_name="doc", backend_server_path="/peer/lob/cloudflare-docs"),
+            ],
+        )
+        mock_server_repository.get.return_value = {
+            "proxy_pass_url": "https://docs.mcp.cloudflare.com",
+            "egress_auth_mode": "obo_exchange",
+        }
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_backend_locations([vs])
+
+        from registry.core.config import settings
+
+        mcp_proxy_target = (
+            f"{settings.auth_server_url.rstrip('/')}/mcp-proxy/peer/lob/cloudflare-docs/"
+        )
+        assert f"proxy_pass {mcp_proxy_target};" in result
+        assert 'set $vs_backend_server_name "peer/lob/cloudflare-docs";' in result
+
+
 class TestWriteVirtualServerMappings:
     """Tests for _write_virtual_server_mappings.
 

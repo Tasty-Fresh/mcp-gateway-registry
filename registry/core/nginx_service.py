@@ -2184,6 +2184,96 @@ map "$uri:$http_x_mcp_server_version" $versioned_backend {{
                 safe_mcp_proxy_url = self._sanitize_for_nginx_set(mcp_proxy_url)
                 safe_upstream_host = self._sanitize_for_nginx_set(upstream_host)
 
+                # Backends that use gateway egress auth (oauth_user / pat /
+                # obo_exchange) must not be proxied directly: the per-user
+                # credential is vended/injected on the auth-server /mcp-proxy hop,
+                # not here. Route the virtual backend dispatch through the same
+                # /validate + /mcp-proxy seam as a directly-registered server so
+                # the existing egress vend/exchange path applies, the caller's
+                # gateway credential is stripped, and only the backend-specific
+                # credential is injected (issue #1607).
+                egress_auth_mode = (server_info.get("egress_auth_mode") or "").strip()
+                if egress_auth_mode in ("oauth_user", "obo_exchange", "pat"):
+                    backend_server_path = backend_path.strip("/")
+                    safe_backend_server_path = self._sanitize_for_nginx_set(backend_server_path)
+                    auth_server_base = settings.auth_server_url.rstrip("/")
+                    mcp_proxy_target = f"{auth_server_base}/mcp-proxy/{backend_server_path}/"
+                    # Sibling minting location: reachable only via ngx.location.capture
+                    # from virtual_backend_mint.lua. It sets the resolved backend markers
+                    # and proxies to auth-server /validate, which authenticates the caller
+                    # and mints the backend-bound X-Internal-Token.
+                    validate_location = f"/_vs_validate{sanitized}"
+                    marker_secret = self._sanitize_for_nginx_set(
+                        os.environ.get("AUTH_SERVER_NGINX_MARKER_SECRET", "")
+                    )
+                    validate_block = f"""
+    location {validate_location} {{
+        internal;
+        # Bind the RESOLVED backend identity + upstream (trusted registry config,
+        # never client headers) so /validate authorizes server={safe_backend_server_path}
+        # and mints a token whose upstream_url claim is exactly this destination.
+        set $backend_url "{safe_mcp_proxy_url}";
+        set $vs_backend_server_name "{safe_backend_server_path}";
+        # Capture the proxied JSON-RPC body so /validate authorizes the real
+        # backend-original method/tool, not the client's virtual alias.
+        rewrite_by_lua_file /etc/nginx/lua/capture_body.lua;
+        # Proxy to auth-server /validate and mint the backend-bound token.
+        proxy_pass {auth_server_base}/validate;
+        # /validate is a GET endpoint (the auth_request contract). This location is
+        # reached via ngx.location.capture with POST (the proxied JSON-RPC body is
+        # carried in X-Body by capture_body.lua above), so force GET on the upstream
+        # hop while preserving X-Body / X-Vs-Backend-Server-Name / X-Resolved-Upstream
+        # / X-Validate-Source-Secret / Authorization metadata.
+        proxy_method GET;
+        proxy_http_version 1.1;
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Original-Method $request_method;
+        proxy_set_header X-Original-URL $scheme://$host$request_uri;
+        proxy_set_header X-Resolved-Upstream $backend_url;
+        proxy_set_header X-Vs-Backend-Server-Name $vs_backend_server_name;
+        proxy_set_header X-Validate-Source-Secret "{marker_secret}";
+        proxy_set_header X-Authorization $http_x_authorization;
+        proxy_pass_request_headers on;
+    }}"""
+                    egress_block = f"""
+    location {location_path} {{
+        internal;
+        # auth_request does NOT run in ngx.location.capture subrequests (nginx only
+        # runs it on the main request), so the backend-bound token is minted by the
+        # rewrite-phase helper below, which captures the sibling {validate_location}
+        # location and exposes the result as $auth_internal_token.
+        set $vs_validate_location "{validate_location}";
+        set $auth_internal_token "";
+        rewrite_by_lua_file /etc/nginx/lua/virtual_backend_mint.lua;
+        proxy_pass {mcp_proxy_target};
+        proxy_http_version 1.1;
+        proxy_ssl_server_name on;
+        proxy_set_header X-Internal-Token $auth_internal_token;
+        # Forward the ingress bearer so the obo_exchange hop can read the
+        # genuine user JWT; mcp_proxy strips it and injects only the
+        # backend-specific credential before reaching the upstream.
+        proxy_set_header Authorization $http_authorization;
+        proxy_set_header X-Authorization $http_x_authorization;
+        proxy_set_header Mcp-Session-Id $http_mcp_session_id;
+        # Forward the validated caller identity so the backend can attribute
+        # writes (set by virtual_router.lua from the parent /validate result).
+        proxy_set_header X-User $http_x_user;
+        proxy_set_header X-Username $http_x_username;
+        # The user's registry session cookie is ingress-only; never forward it.
+        proxy_set_header Cookie "";
+        proxy_pass_request_headers on;
+        proxy_buffering off;
+        proxy_set_header Accept "application/json, text/event-stream";
+        proxy_set_header Content-Type $content_type;
+    }}"""
+                    location_blocks.append(validate_block)
+                    location_blocks.append(egress_block)
+                    logger.debug(
+                        f"Generated egress virtual backend locations for {backend_path} "
+                        f"(egress_auth_mode={egress_auth_mode}) -> {location_path}"
+                    )
+                    continue
+
                 if host_is_resolvable_at_startup:
                     proxy_directive = f"proxy_pass {safe_mcp_proxy_url};"
                 else:

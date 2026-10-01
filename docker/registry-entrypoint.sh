@@ -184,6 +184,7 @@ mkdir -p "$LUA_SCRIPTS_DIR/virtual_mappings"
 LUA_SOURCE_DIR="/app/docker/lua"
 cp "$LUA_SOURCE_DIR/capture_body.lua" "$LUA_SCRIPTS_DIR/capture_body.lua"
 cp "$LUA_SOURCE_DIR/virtual_router.lua" "$LUA_SCRIPTS_DIR/virtual_router.lua"
+cp "$LUA_SOURCE_DIR/virtual_backend_mint.lua" "$LUA_SCRIPTS_DIR/virtual_backend_mint.lua"
 
 cp "$LUA_SOURCE_DIR/emit_metrics.lua" "$LUA_SCRIPTS_DIR/emit_metrics.lua"
 cp "$LUA_SOURCE_DIR/flush_metrics.lua" "$LUA_SCRIPTS_DIR/flush_metrics.lua"

@@ -19,13 +19,15 @@ import pytest
 
 os.environ.setdefault("SECRET_KEY", "test-secret-key-that-is-definitely-long-enough-32b")
 
-from internal_request_token import GENERIC_PROXY_AUDIENCE  # noqa: E402
+from fastapi import HTTPException
+from internal_request_token import GENERIC_PROXY_AUDIENCE, MCP_PROXY_AUDIENCE  # noqa: E402
 
 from auth_server.server import (  # noqa: E402
     _attach_generic_proxy_token,
     _attach_mcp_proxy_token,
     _generic_write_csrf_refused,
     _is_cookie_auth_method,
+    _validate_virtual_backend_marker,
     settings,
 )
 
@@ -174,6 +176,89 @@ class TestDisjointFromMcpMint:
             )
         assert "X-Internal-Token" in resp.headers  # MCP mint fired
         assert "X-Internal-Token-Generic" not in resp.headers  # generic mint did not
+
+
+class TestValidateVirtualBackendMarker:
+    """Fail-closed trust boundary for X-Vs-Backend-Server-Name (issue #1607).
+
+    The backend marker overrides server_name -- driving scope authorization,
+    backend identity, and X-Internal-Token minting -- so it must be gated by the
+    SAME nginx source marker (X-Validate-Source-Secret) as X-Resolved-Upstream.
+    """
+
+    def test_valid_marker_applies_backend_override(self):
+        req = _Req(
+            {
+                "X-Vs-Backend-Server-Name": "github",
+                "X-Validate-Source-Secret": settings.auth_server_nginx_marker_secret,
+            }
+        )
+        # No raise => the backend override (server_name = backend path) may apply.
+        _validate_virtual_backend_marker("github", req)
+
+    def test_missing_nginx_marker_rejected(self):
+        req = _Req({"X-Vs-Backend-Server-Name": "github"})
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_virtual_backend_marker("github", req)
+        assert exc_info.value.status_code == 403
+
+    def test_wrong_nginx_marker_rejected(self):
+        req = _Req(
+            {
+                "X-Vs-Backend-Server-Name": "github",
+                "X-Validate-Source-Secret": "wrong-marker-secret",
+            }
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_virtual_backend_marker("github", req)
+        assert exc_info.value.status_code == 403
+
+    def test_no_backend_marker_unchanged(self):
+        # Absent X-Vs-Backend-Server-Name -> no rejection; existing URL-derived path.
+        req = _Req({})
+        _validate_virtual_backend_marker("", req)
+
+    def test_empty_nginx_marker_secret_rejected(self, monkeypatch):
+        # An unset/empty marker secret can never match -> fail closed.
+        monkeypatch.setattr(settings, "auth_server_nginx_marker_secret", "")
+        req = _Req(
+            {
+                "X-Vs-Backend-Server-Name": "github",
+                "X-Validate-Source-Secret": "",
+            }
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_virtual_backend_marker("github", req)
+        assert exc_info.value.status_code == 403
+
+    def test_valid_marker_mints_backend_bound_token(self):
+        # The full virtual-egress mint flow: a valid backend marker + resolved
+        # upstream + valid nginx marker mints an internal token whose `server`
+        # claim is the RESOLVED backend (not the virtual alias).
+        req = _Req(
+            {
+                "X-Resolved-Upstream": "https://freshguard.example/api/mcp",
+                "X-Vs-Backend-Server-Name": "freshguard",
+                "X-Validate-Source-Secret": settings.auth_server_nginx_marker_secret,
+            }
+        )
+        resp = _Resp()
+        _validate_virtual_backend_marker("freshguard", req)
+        with patch.dict(os.environ, {"SECRET_KEY": _SECRET}, clear=False):
+            _attach_mcp_proxy_token(
+                req,
+                resp,
+                subject="alice",
+                scopes=["freshguard.tools/call"],
+                server_name="freshguard",
+                auth_method="entra",
+                egress_user="alice@corp",
+            )
+        tok = resp.headers["X-Internal-Token"]
+        claims = pyjwt.decode(tok, _SECRET, algorithms=["HS256"], audience=MCP_PROXY_AUDIENCE)
+        assert claims["server"] == "freshguard"
+        assert claims["upstream_url"] == "https://freshguard.example/api/mcp"
+        assert claims["sub"] == "alice"
 
 
 class TestCookieAuthClassifier:
