@@ -125,6 +125,61 @@ class TestGenerateVirtualServerBlocks:
         assert "error_page 403 = @forbidden_error" in result
 
     @pytest.mark.asyncio
+    async def test_block_sets_per_server_resource_metadata_on_entra(
+        self, mock_virtual_server_repository, monkeypatch
+    ):
+        """Virtual servers on Entra must advertise a per-server RFC 9728 PRM so
+        MCP clients discover the /virtual/<name>/mcp resource instead of the
+        bare-origin gateway PRM Entra rejects (issue: virtual OAuth onboarding)."""
+        import registry.api.wellknown_routes as wellknown
+        import registry.core.nginx_service as ns_module
+
+        vs = _make_vs_config()
+        mock_virtual_server_repository.list_enabled.return_value = [vs]
+
+        # Patch the settings objects the predicate + PRM URL builder read (the
+        # predicate lives in wellknown_routes; the URL builder in nginx_service).
+        wr_settings = MagicMock()
+        wr_settings.auth_provider = "entra"
+        monkeypatch.setattr(wellknown, "settings", wr_settings)
+        monkeypatch.setattr(ns_module.settings, "registry_url", "https://gw.example.com")
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_server_blocks()
+
+        assert "set $mcp_resource_metadata " in result
+        assert (
+            "https://gw.example.com/.well-known/oauth-protected-resource/"
+            "virtual/dev-essentials/mcp" in result
+        )
+
+    @pytest.mark.asyncio
+    async def test_block_omits_per_server_resource_metadata_on_lenient_idp(
+        self, mock_virtual_server_repository, monkeypatch
+    ):
+        """On a lenient IdP, a virtual server with plain backends keeps the
+        gateway-wide PRM (no per-server $mcp_resource_metadata override)."""
+        import registry.api.wellknown_routes as wellknown
+        import registry.core.nginx_service as ns_module
+
+        vs = _make_vs_config()
+        mock_virtual_server_repository.list_enabled.return_value = [vs]
+
+        wr_settings = MagicMock()
+        wr_settings.auth_provider = "keycloak"
+        monkeypatch.setattr(wellknown, "settings", wr_settings)
+        monkeypatch.setattr(ns_module.settings, "registry_url", "https://gw.example.com")
+
+        from registry.core.nginx_service import NginxConfigService
+
+        service = NginxConfigService()
+        result = await service._generate_virtual_server_blocks()
+
+        assert "set $mcp_resource_metadata " not in result
+
+    @pytest.mark.asyncio
     async def test_location_normalised_to_trailing_slash(self, mock_virtual_server_repository):
         """Issue #1501: the virtual-server location must render with a trailing
         slash so nginx does a subtree prefix match (`/virtual/dev/`) instead of
@@ -713,7 +768,7 @@ class TestWriteVirtualServerMappings:
             ],
             tool_scope_overrides=[
                 ToolScopeOverride(
-                    tool_alias="search",
+                    tool_alias="github__search",
                     required_scopes=["github:read"],
                 ),
             ],
@@ -785,8 +840,11 @@ class TestWriteVirtualServerMappings:
                 await service._write_virtual_server_mappings([vs])
 
         assert "tool_backend_map" in written_data
-        assert "search" in written_data["tool_backend_map"]
-        assert "/_vs_backend" in written_data["tool_backend_map"]["search"]["backend_location"]
+        assert "github__search" in written_data["tool_backend_map"]
+        assert (
+            "/_vs_backend" in written_data["tool_backend_map"]["github__search"]["backend_location"]
+        )
+        assert written_data["tool_backend_map"]["github__search"]["original_name"] == "search"
 
 
 class TestSanitizePathForLocation:

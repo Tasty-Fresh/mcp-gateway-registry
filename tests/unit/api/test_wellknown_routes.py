@@ -382,6 +382,35 @@ class TestServerNeedsPerServerPrm:
         assert self._gate("none", "Entra") is True
 
 
+class TestServerListNeedsPerServerPrm:
+    """server_list_needs_per_server_prm() gate for virtual MCP servers.
+
+    A virtual server aggregates multiple backends and has no single
+    egress_auth_mode; its PRM requirement is the union of its backends' modes.
+    """
+
+    def _gate(self, egress_modes, auth_provider):
+        from registry.api.wellknown_routes import server_list_needs_per_server_prm
+
+        mock_settings = MagicMock()
+        mock_settings.auth_provider = auth_provider
+        with patch("registry.api.wellknown_routes.settings", mock_settings):
+            return server_list_needs_per_server_prm(egress_modes)
+
+    def test_entra_virtual_always_gets_per_server_prm(self):
+        assert self._gate([], "entra") is True
+        assert self._gate(["none"], "entra") is True
+        assert self._gate(["obo_exchange", "none"], "entra") is True
+
+    def test_keycloak_virtual_with_obo_backend_gets_per_server_prm(self):
+        assert self._gate(["obo_exchange"], "keycloak") is True
+
+    def test_keycloak_virtual_plain_backends_use_global_prm(self):
+        assert self._gate(["none"], "keycloak") is False
+        assert self._gate(["oauth_user"], "keycloak") is False
+        assert self._gate([], "keycloak") is False
+
+
 class TestOAuthAuthorizationServerEndpoint:
     """Tests for GET /.well-known/oauth-authorization-server (RFC 8414)."""
 
@@ -674,6 +703,83 @@ class TestPerServerOAuthProtectedResource:
         ):
             client = TestClient(_make_oauth_discovery_app(fake_provider))
             resp = client.get("/.well-known/oauth-protected-resource/nope/mcp")
+            assert resp.status_code == 404
+
+    def test_virtual_server_returns_per_server_prm_on_entra(self, fake_provider):
+        # A virtual MCP server (no single egress_auth_mode) must get a per-server
+        # PRM on Entra (issue #990 applies to virtual servers too): resource =
+        # its connection URL, so the Entra App ID URI matches.
+        s = self._settings(auth_provider="entra")
+        vs = MagicMock()
+        vs.is_enabled = True
+        vs.tool_mappings = []
+        with (
+            patch(
+                "registry.api.wellknown_routes._get_active_auth_provider",
+                return_value=fake_provider,
+            ),
+            patch("registry.auth.oauth_metadata.settings", s),
+            patch("registry.api.wellknown_routes.settings", s),
+            patch(
+                "registry.api.wellknown_routes.get_virtual_server_repository",
+                return_value=MagicMock(get=AsyncMock(return_value=vs)),
+            ),
+        ):
+            client = TestClient(_make_oauth_discovery_app(fake_provider))
+            resp = client.get("/.well-known/oauth-protected-resource/virtual/tasty/mcp")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["resource"] == "https://gw.example.com/virtual/tasty/mcp"
+            assert data["scopes_supported"] == [
+                "https://gw.example.com/virtual/tasty/mcp/user_impersonation"
+            ]
+
+    def test_virtual_server_404s_when_disabled(self, fake_provider):
+        s = self._settings(auth_provider="entra")
+        vs = MagicMock()
+        vs.is_enabled = False
+        vs.tool_mappings = []
+        with (
+            patch(
+                "registry.api.wellknown_routes._get_active_auth_provider",
+                return_value=fake_provider,
+            ),
+            patch("registry.auth.oauth_metadata.settings", s),
+            patch("registry.api.wellknown_routes.settings", s),
+            patch(
+                "registry.api.wellknown_routes.get_virtual_server_repository",
+                return_value=MagicMock(get=AsyncMock(return_value=vs)),
+            ),
+        ):
+            client = TestClient(_make_oauth_discovery_app(fake_provider))
+            resp = client.get("/.well-known/oauth-protected-resource/virtual/tasty/mcp")
+            assert resp.status_code == 404
+
+    def test_virtual_server_plain_backends_use_global_prm_on_keycloak(self, fake_provider):
+        # On a lenient IdP, a virtual server whose backends don't force a
+        # per-server PRM falls back to the global PRM (404 here -> fallback).
+        s = self._settings(auth_provider="keycloak")
+        vs = MagicMock()
+        vs.is_enabled = True
+        vs.tool_mappings = [MagicMock(backend_server_path="/plain")]
+        with (
+            patch(
+                "registry.api.wellknown_routes._get_active_auth_provider",
+                return_value=fake_provider,
+            ),
+            patch("registry.auth.oauth_metadata.settings", s),
+            patch("registry.api.wellknown_routes.settings", s),
+            patch(
+                "registry.api.wellknown_routes.get_virtual_server_repository",
+                return_value=MagicMock(get=AsyncMock(return_value=vs)),
+            ),
+            patch(
+                "registry.api.wellknown_routes.server_service.get_server_info",
+                new=AsyncMock(return_value={"egress_auth_mode": "none"}),
+            ),
+        ):
+            client = TestClient(_make_oauth_discovery_app(fake_provider))
+            resp = client.get("/.well-known/oauth-protected-resource/virtual/tasty/mcp")
             assert resp.status_code == 404
 
     def test_server_lookup_failure_returns_502_not_500(self, fake_provider):

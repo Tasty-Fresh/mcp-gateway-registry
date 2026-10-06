@@ -1772,6 +1772,42 @@ map "$uri:$http_x_mcp_server_version" $versioned_backend {{
                 # URI, so the added slash does not affect routing.
                 safe_vs_path = self._sanitize_for_nginx_set(vs.path).rstrip("/") + "/"
 
+                # Determine whether this virtual server needs a per-server RFC 9728
+                # PRM. Virtual servers have no single egress_auth_mode; the predicate
+                # is the union of their backends' modes (same shared source of truth
+                # as registered servers: Entra -> always, otherwise obo_exchange).
+                from registry.api.wellknown_routes import server_list_needs_per_server_prm
+                from registry.auth.oauth_metadata import build_per_server_prm_url
+                from registry.repositories.factory import get_server_repository
+
+                backend_egress_modes: list[str | None] = []
+                for tm in vs.tool_mappings:
+                    backend = None
+                    try:
+                        backend = await get_server_repository().get(tm.backend_server_path)
+                    except Exception:
+                        logger.exception(
+                            "Virtual PRM: backend lookup failed for %s", tm.backend_server_path
+                        )
+                    backend_egress_modes.append(
+                        (backend or {}).get("egress_auth_mode")
+                        if isinstance(backend, dict)
+                        else None
+                    )
+
+                vs_resource_metadata = ""
+                if server_list_needs_per_server_prm(backend_egress_modes):
+                    try:
+                        per_server_prm = build_per_server_prm_url(
+                            settings.registry_url, vs.path, append_mcp=True
+                        )
+                        safe_per_server_prm = self._sanitize_for_nginx_set(per_server_prm)
+                        vs_resource_metadata = (
+                            f'\n        set $mcp_resource_metadata "{safe_per_server_prm}";'
+                        )
+                    except ValueError:
+                        vs_resource_metadata = ""
+
                 block = f"""
     # Virtual MCP Server: {safe_name}
     location {{{{ROOT_PATH}}}}{safe_vs_path} {{
@@ -1793,7 +1829,7 @@ map "$uri:$http_x_mcp_server_version" $versioned_backend {{
         # Route 401s through @auth_error so the WWW-Authenticate header
         # mandated by RFC 9728 §5.1 is emitted (issue #989).
         error_page 401 = @auth_error;
-        error_page 403 = @forbidden_error;
+        error_page 403 = @forbidden_error;{vs_resource_metadata}
     }}"""
                 location_blocks.append(block)
                 logger.debug(f"Generated virtual server location block for {vs.path}")
@@ -2362,7 +2398,7 @@ map "$uri:$http_x_mcp_server_version" $versioned_backend {{
                 for tm in vs.tool_mappings:
                     sanitized_backend = self._sanitize_path_for_location(tm.backend_server_path)
                     backend_location = f"/_vs_backend{sanitized_backend}"
-                    tool_display_name = tm.alias if tm.alias else tm.tool_name
+                    tool_display_name = tm.effective_name()
 
                     # Get tool metadata from the backend server
                     server_info = await server_repo.get(tm.backend_server_path)
