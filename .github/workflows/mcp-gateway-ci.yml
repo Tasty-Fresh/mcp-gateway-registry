@@ -1,0 +1,95 @@
+name: MCP Gateway - Build and publish
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set image variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          OWNER_LC="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          TAG="main-${SHORT_SHA}"
+          echo "registry_image=ghcr.io/${OWNER_LC}/mcp-gateway-registry" >> "$GITHUB_OUTPUT"
+          echo "auth_server_image=ghcr.io/${OWNER_LC}/mcp-gateway-auth-server" >> "$GITHUB_OUTPUT"
+          echo "mcpgw_image=ghcr.io/${OWNER_LC}/mcp-gateway-mcpgw" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push registry image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile.registry
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.vars.outputs.registry_image }}:${{ steps.vars.outputs.tag }}
+          build-args: |
+            BUILD_VERSION=${{ steps.vars.outputs.tag }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push auth-server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile.auth
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.vars.outputs.auth_server_image }}:${{ steps.vars.outputs.tag }}
+          build-args: |
+            BUILD_VERSION=${{ steps.vars.outputs.tag }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push mcpgw image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile.mcp-server
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.vars.outputs.mcpgw_image }}:${{ steps.vars.outputs.tag }}
+          build-args: |
+            SERVER_DIR=servers/mcpgw
+            BUILD_VERSION=${{ steps.vars.outputs.tag }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
