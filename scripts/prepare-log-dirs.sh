@@ -19,24 +19,39 @@ OWNER_UID="${LOG_DIR_OWNER_UID:-1000}"
 OWNER_GID="${LOG_DIR_OWNER_GID:-1000}"
 DIR_MODE="${LOG_DIR_MODE:-0750}"
 
-if [ "$(id -u)" -eq 0 ]; then
-    SUDO=""
-else
-    SUDO="sudo"
-fi
-
 echo "Preparing host log directory for AI Registry..."
 echo "  Path:  ${LOG_BASE}"
 echo "  Owner: ${OWNER_UID}:${OWNER_GID}"
 echo "  Mode:  ${DIR_MODE}"
 
-if [ ! -d "${LOG_BASE}" ]; then
-    echo "Creating ${LOG_BASE}"
-    ${SUDO} mkdir -p "${LOG_BASE}"
+# Ownership must map to the container uid/gid (1000:1000), and it must not
+# require sudo. For rootless Podman, `podman unshare` runs the command in the
+# user namespace where the caller maps to root, so mkdir/chown/chmod can operate
+# on root-owned host paths without sudo. For a rootful deployment (running as
+# root) the plain commands already have permission. For a non-root non-Podman
+# deployment (e.g. rootful Docker), fall back to sudo as before.
+if command -v podman &> /dev/null && [ "$(id -u)" -ne 0 ]; then
+    echo "Using rootless Podman (podman unshare) to set ownership without sudo..."
+    if [ ! -d "${LOG_BASE}" ]; then
+        echo "Creating ${LOG_BASE} (via podman unshare)"
+        podman unshare mkdir -p "${LOG_BASE}"
+    fi
+    podman unshare chown -R "${OWNER_UID}:${OWNER_GID}" "${LOG_BASE}"
+    podman unshare chmod "${DIR_MODE}" "${LOG_BASE}"
+elif [ "$(id -u)" -eq 0 ]; then
+    echo "Running as root; setting ownership directly..."
+    mkdir -p "${LOG_BASE}"
+    chown -R "${OWNER_UID}:${OWNER_GID}" "${LOG_BASE}"
+    chmod "${DIR_MODE}" "${LOG_BASE}"
+else
+    echo "Not rootless Podman and not root; using sudo for ownership..."
+    if [ ! -d "${LOG_BASE}" ]; then
+        echo "Creating ${LOG_BASE} (via sudo)"
+        sudo mkdir -p "${LOG_BASE}"
+    fi
+    sudo chown -R "${OWNER_UID}:${OWNER_GID}" "${LOG_BASE}"
+    sudo chmod "${DIR_MODE}" "${LOG_BASE}"
 fi
-
-${SUDO} chown -R "${OWNER_UID}:${OWNER_GID}" "${LOG_BASE}"
-${SUDO} chmod "${DIR_MODE}" "${LOG_BASE}"
 
 echo "OK: ${LOG_BASE} prepared"
 ls -ld "${LOG_BASE}"

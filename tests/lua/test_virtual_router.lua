@@ -68,6 +68,7 @@ _G.ngx = {
     ERR = 4,
     WARN = 5,
     HTTP_POST = 8,
+    escape_uri = function(s) return s end,
     var = { request_id = "0" },
     status = 200,
     say = function() end,
@@ -262,6 +263,161 @@ do
     local body = M._handle_tools_list("1", mapping, "", nil, "srv4")
     check(body:find('"required":[]', 1, true) == nil,
         "a property called 'required' is not coerced into an array")
+end
+
+-- ---------------------------------------------------------------------------
+print("test: _initialize_backend distinguishes stateless vs stateful vs failure")
+do
+    ngx.var.auth_user = "alice"
+    ngx.var.auth_username = "alice@corp"
+
+    -- 200 with no Mcp-Session-Id -> stateless sentinel
+    capture_responses["/stateless"] = { status = 200,
+        body = cjson.encode({ result = {} }), header = {} }
+    local sid = M._initialize_backend("/stateless")
+    check(M._is_stateless_session(sid), "200 without Mcp-Session-Id -> stateless sentinel")
+
+    -- 200 with a real session id -> the id
+    capture_responses["/stateful"] = { status = 200,
+        body = cjson.encode({ result = {} }),
+        header = { ["Mcp-Session-Id"] = "backend-sess-1" } }
+    local sid2 = M._initialize_backend("/stateful")
+    check(sid2 == "backend-sess-1", "200 with Mcp-Session-Id -> session id")
+
+    -- non-200 -> nil (failure, not stateless)
+    capture_responses["/broken"] = { status = 500, body = "" }
+    local sid3 = M._initialize_backend("/broken")
+    check(sid3 == nil, "non-200 -> nil (failure)")
+end
+
+-- ---------------------------------------------------------------------------
+print("test: stateless backend is cached in L1 and does not re-initialize")
+do
+    ngx.var.auth_user = "alice"
+    ngx.var.auth_username = "alice@corp"
+
+    dict._store["bsess:vs-stateless:/backend"] = nil
+
+    local backend_calls = 0
+    local real_capture = ngx.location.capture
+    ngx.location.capture = function(loc, _opts)
+        if loc == "/backend" then
+            backend_calls = backend_calls + 1
+        end
+        return capture_responses[loc]
+    end
+
+    capture_responses["/backend"] = { status = 200,
+        body = cjson.encode({ result = {} }), header = {} }
+    capture_responses["/_internal/sessions/backend/vs-stateless:/backend?user_id=alice"] =
+        { status = 404, body = "" }
+
+    local s1 = M._get_backend_session("vs-stateless", "/backend", "srv")
+    check(M._is_stateless_session(s1), "first call returns the stateless sentinel")
+    check(backend_calls == 1, "first call initializes the backend exactly once")
+
+    local s2 = M._get_backend_session("vs-stateless", "/backend", "srv")
+    check(M._is_stateless_session(s2), "second call returns the stateless sentinel")
+    check(backend_calls == 1, "second call does NOT re-initialize (L1 sentinel hit)")
+    check(dict._store["bsess:vs-stateless:/backend"] == "__stateless__",
+        "stateless sentinel is cached in L1")
+
+    ngx.location.capture = real_capture
+end
+
+-- ---------------------------------------------------------------------------
+print("test: _set_backend_session_header never sends the sentinel on the wire")
+do
+    M._set_backend_session_header("__stateless__")
+    check(ngx.req._headers["Mcp-Session-Id"] == "",
+        "stateless sentinel clears Mcp-Session-Id")
+
+    M._set_backend_session_header("backend-sess-2")
+    check(ngx.req._headers["Mcp-Session-Id"] == "backend-sess-2",
+        "real session id is set")
+
+    M._set_backend_session_header(nil)
+    check(ngx.req._headers["Mcp-Session-Id"] == "",
+        "nil session clears Mcp-Session-Id")
+end
+
+-- ---------------------------------------------------------------------------
+print("test: _initialize_backend sends notifications/initialized with the session id")
+do
+    ngx.var.auth_user = "alice"
+
+    local captured = {}
+    local real_capture = ngx.location.capture
+    ngx.location.capture = function(loc, opts)
+        captured[#captured + 1] = { loc = loc, opts = opts }
+        return capture_responses[loc]
+    end
+
+    capture_responses["/_vs_backend_freshguard"] = {
+        status = 200,
+        body = cjson.encode({ result = {} }),
+        header = { ["Mcp-Session-Id"] = "fg-X" },
+    }
+
+    local sid = M._initialize_backend("/_vs_backend_freshguard")
+    check(sid == "fg-X", "initialize returns the backend session id")
+
+    check(#captured == 2, "two captures: initialize + notifications/initialized")
+    local n = captured[2]
+    check(n and n.loc == "/_vs_backend_freshguard",
+        "second capture targets the backend")
+    local ok_dec, notif_data = pcall(cjson.decode, n and n.opts and n.opts.body or "")
+    check(ok_dec and notif_data.method == "notifications/initialized",
+        "second capture body is notifications/initialized")
+    check(ngx.req._headers["Mcp-Session-Id"] == "fg-X",
+        "notifications/initialized is sent with the backend session id")
+
+    ngx.location.capture = real_capture
+end
+
+-- ---------------------------------------------------------------------------
+print("test: stateful backend session is initialized once and reused (L1)")
+do
+    ngx.var.auth_user = "alice"
+    dict._store["bsess:vs-A:/_vs_backend_freshguard"] = nil
+
+    local backend_calls = 0
+    local real_capture = ngx.location.capture
+    ngx.location.capture = function(loc, _opts)
+        if loc == "/_vs_backend_freshguard" then backend_calls = backend_calls + 1 end
+        return capture_responses[loc]
+    end
+
+    capture_responses["/_vs_backend_freshguard"] = {
+        status = 200, body = cjson.encode({ result = {} }),
+        header = { ["Mcp-Session-Id"] = "fg-X" },
+    }
+    capture_responses["/_internal/sessions/backend/vs-A:/_vs_backend_freshguard?user_id=alice"] =
+        { status = 404, body = "" }
+
+    local s1 = M._get_backend_session("vs-A", "/_vs_backend_freshguard", "tasty")
+    check(s1 == "fg-X", "first call initializes and returns fg-X")
+
+    local s2 = M._get_backend_session("vs-A", "/_vs_backend_freshguard", "tasty")
+    check(s2 == "fg-X", "second call reuses the backend session from L1 cache")
+    check(backend_calls > 0, "backend was initialized (L2 miss path)")
+    check(dict._store["bsess:vs-A:/_vs_backend_freshguard"] == "fg-X",
+        "backend session persisted in L1 cache")
+
+    ngx.location.capture = real_capture
+end
+
+-- ---------------------------------------------------------------------------
+print("test: backend session header is the backend id, never the virtual (vs-) id")
+do
+    M._set_backend_session_header("fg-X")
+    check(ngx.req._headers["Mcp-Session-Id"] == "fg-X",
+        "backend session id set on Mcp-Session-Id")
+    check(ngx.req._headers["Mcp-Session-Id"] ~= "vs-A",
+        "virtual session id (vs-A) is never set as Mcp-Session-Id")
+    M._set_backend_session_header(nil)
+    check(ngx.req._headers["Mcp-Session-Id"] == "",
+        "cleared when no backend session")
 end
 
 -- ---------------------------------------------------------------------------

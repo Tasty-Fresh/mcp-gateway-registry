@@ -5,6 +5,7 @@ import {
   CreateVirtualServerRequest,
   UpdateVirtualServerRequest,
   ToolMapping,
+  buildEffectiveToolName,
 } from '../types/virtualServer';
 import ToolSelector from './ToolSelector';
 import { pathFromName } from '../utils/slug';
@@ -561,7 +562,7 @@ const VirtualServerForm: React.FC<VirtualServerFormProps> = ({
               >
                 <div className="flex items-center gap-2">
                   <span className="font-mono text-gray-900 dark:text-white">
-                    {mapping.alias || mapping.tool_name}
+                    {buildEffectiveToolName(mapping)}
                   </span>
                   {mapping.alias && (
                     <span className="text-xs text-gray-500 dark:text-gray-400">

@@ -88,8 +88,8 @@ def _get_unique_backends(
 def _get_effective_tool_name(
     mapping: ToolMapping,
 ) -> str:
-    """Get the effective tool name (alias if set, otherwise original)."""
-    return mapping.alias if mapping.alias else mapping.tool_name
+    """Get the effective tool name (alias if set, otherwise backend-path namespaced)."""
+    return mapping.effective_name()
 
 
 def _caller_has_required_scopes(

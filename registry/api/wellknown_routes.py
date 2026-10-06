@@ -14,7 +14,7 @@ from ..auth.oauth_metadata import (
     entra_forces_per_server_prm,
 )
 from ..core.config import settings
-from ..repositories.factory import get_registry_card_repository
+from ..repositories.factory import get_registry_card_repository, get_virtual_server_repository
 from ..schemas.registry_card import RegistryCard, RegistryContact
 from ..services import ard_service
 from ..services.server_service import server_service
@@ -290,6 +290,22 @@ def server_needs_per_server_prm(egress_auth_mode: str | None) -> bool:
     return False
 
 
+def server_list_needs_per_server_prm(egress_auth_modes: list[str | None]) -> bool:
+    """Whether ANY of a list of egress modes forces a per-server RFC 9728 PRM.
+
+    Virtual MCP servers aggregate multiple registered backends and therefore have
+    no single ``egress_auth_mode`` field; their PRM requirement is the union of
+    their backends' requirements. On Entra every server (virtual included) needs a
+    per-server PRM (issue #990); otherwise a backend only forces one when it is
+    ``obo_exchange`` (the OBO ingress leg logs the user in at the gateway against
+    a per-server resource) or ``oauth_user`` on Entra (already covered by the Entra
+    short-circuit).
+    """
+    if entra_forces_per_server_prm(settings.auth_provider):
+        return True
+    return any(server_needs_per_server_prm(mode) for mode in egress_auth_modes)
+
+
 @router.get("/oauth-protected-resource")
 async def get_oauth_protected_resource() -> JSONResponse:
     """
@@ -393,24 +409,54 @@ async def get_oauth_protected_resource_for_server(
     and this per-server PRM is what makes Entra ingress login work.
     """
     normalized = _normalize_prm_server_path(server_path)
-    # Server lookup is inside a guard: a repository/backend error on this
-    # UNAUTHENTICATED endpoint must not surface as an unhandled 500 with a
-    # traceback. Fail closed to a generic 502 (logged for operators).
-    try:
-        info = await server_service.get_server_info(normalized)
-    except Exception:
-        logger.exception("Per-server PRM: server lookup failed for %s", normalized)
-        raise HTTPException(
-            status_code=502, detail="Could not build Protected Resource Metadata"
-        ) from None
-    if not info or not server_needs_per_server_prm(info.get("egress_auth_mode")):
-        # No per-server PRM for this server -> client falls back to the global PRM.
-        raise HTTPException(status_code=404, detail="no per-server resource metadata")
+
+    # Virtual MCP servers are a separate model (no single egress_auth_mode): the
+    # per-server PRM requirement is the union of their backends' requirements
+    # (see server_list_needs_per_server_prm). The virtual connection URL always
+    # carries the /mcp transport suffix, so append_mcp is fixed True.
+    append_mcp = True
+    if normalized.startswith("/virtual/"):
+        try:
+            vs = await get_virtual_server_repository().get(normalized)
+        except Exception:
+            logger.exception("Per-server PRM: virtual server lookup failed for %s", normalized)
+            raise HTTPException(
+                status_code=502, detail="Could not build Protected Resource Metadata"
+            ) from None
+        if not vs or not vs.is_enabled:
+            raise HTTPException(status_code=404, detail="no per-server resource metadata")
+
+        egress_modes: list[str | None] = []
+        for tm in vs.tool_mappings:
+            try:
+                backend = await server_service.get_server_info(tm.backend_server_path)
+            except Exception:
+                logger.exception(
+                    "Per-server PRM: backend lookup failed for %s", tm.backend_server_path
+                )
+                continue
+            egress_modes.append((backend or {}).get("egress_auth_mode"))
+        if not server_list_needs_per_server_prm(egress_modes):
+            raise HTTPException(status_code=404, detail="no per-server resource metadata")
+    else:
+        # Server lookup is inside a guard: a repository/backend error on this
+        # UNAUTHENTICATED endpoint must not surface as an unhandled 500 with a
+        # traceback. Fail closed to a generic 502 (logged for operators).
+        try:
+            info = await server_service.get_server_info(normalized)
+        except Exception:
+            logger.exception("Per-server PRM: server lookup failed for %s", normalized)
+            raise HTTPException(
+                status_code=502, detail="Could not build Protected Resource Metadata"
+            ) from None
+        if not info or not server_needs_per_server_prm(info.get("egress_auth_mode")):
+            # No per-server PRM for this server -> client falls back to the global PRM.
+            raise HTTPException(status_code=404, detail="no per-server resource metadata")
+        append_mcp = info.get("append_mcp_path") is not False
 
     # Per-server connection-URL resource: the only value that satisfies the
     # client's RFC 9728 §3.3 match, RFC 8707 canonicalization, and Entra's exact
     # App ID URI match simultaneously (see the docstring).
-    append_mcp = info.get("append_mcp_path") is not False
     resource = build_per_server_resource_url(
         settings.registry_url, normalized, append_mcp=append_mcp
     )

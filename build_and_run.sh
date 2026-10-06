@@ -227,7 +227,7 @@ log "Found .env file"
 source .env
 
 # Check if docker compose is installed
-if ! docker compose version &> /dev/null; then
+if ! $COMPOSE_CMD version &> /dev/null; then
     log "ERROR: docker compose is not available"
     log "Please install Docker Compose v2: https://docs.docker.com/compose/install/"
     exit 1

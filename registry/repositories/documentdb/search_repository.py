@@ -1418,7 +1418,7 @@ class DocumentDBSearchRepository(SearchRepositoryBase):
         tools = []
         tool_names = []
         for mapping in virtual_server.tool_mappings:
-            display_name = mapping.alias or mapping.tool_name
+            display_name = mapping.effective_name()
             tool_names.append(display_name)
 
             # Use description_override if set, otherwise get from backend

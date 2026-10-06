@@ -714,6 +714,51 @@ def _audit_request_id_from_token(claims: dict) -> str | None:
     return _claim_str(raw.get("rid"))
 
 
+def _validate_virtual_backend_marker(
+    virtual_backend_server_name: str,
+    request: "Request",
+) -> None:
+    """Fail closed when a virtual-egress backend marker lacks the nginx trust marker.
+
+    ``X-Vs-Backend-Server-Name`` overrides ``server_name``, which drives scope
+    authorization, backend identity, and ``X-Internal-Token`` minting. It is
+    trusted ONLY when the shared /validate block also force-set the matching
+    ``X-Validate-Source-Secret`` (``settings.auth_server_nginx_marker_secret``) --
+    the SAME auth-server-side trust boundary as ``X-Resolved-Upstream`` (see
+    ``_attach_mcp_proxy_token`` / ``_attach_generic_proxy_token``). A caller that
+    reaches auth-server directly cannot supply a valid marker, so a present
+    backend marker with a missing/empty/mismatched nginx marker is refused with
+    403 rather than silently ignored or fallen back to the URL-derived server name.
+
+    Args:
+        virtual_backend_server_name: stripped ``X-Vs-Backend-Server-Name`` value
+            (empty when the header is absent).
+        request: the /validate subrequest.
+
+    Raises:
+        HTTPException: 403 when the backend marker is present but the nginx
+            source marker is missing, empty, or does not match.
+    """
+    if not virtual_backend_server_name:
+        return
+
+    marker = settings.auth_server_nginx_marker_secret
+    if not marker or not secrets.compare_digest(
+        request.headers.get("X-Validate-Source-Secret", ""),
+        marker,
+    ):
+        logger.warning(
+            "/validate: X-Vs-Backend-Server-Name present but nginx marker "
+            "missing/mismatched; refusing virtual-egress backend hop "
+            "(possible direct auth-server bypass)"
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Virtual backend marker rejected: nginx source marker missing or invalid",
+            headers={"Connection": "close"},
+        )
+
+
 def _attach_mcp_proxy_token(
     request: "Request",
     response: "JSONResponse",
@@ -3771,6 +3816,16 @@ async def validate_request(request: Request):
         original_method = (request.headers.get("X-Original-Method") or "").strip().upper()
         is_generic_request = bool(generic_proxy_kind)
 
+        # Virtual-server egress backend marker (server-set in the generated
+        # /_vs_backend* egress blocks, forwarded verbatim by the shared /validate
+        # block; empty for all non-virtual-egress requests). It carries the
+        # RESOLVED backend server path so /validate authorizes + mints the internal
+        # token against the backend identity, not the virtual alias.
+        virtual_backend_server_name = (
+            request.headers.get("X-Vs-Backend-Server-Name") or ""
+        ).strip()
+        _validate_virtual_backend_marker(virtual_backend_server_name, request)
+
         # Extract server_name and endpoint from original_url early for logging
         server_name_from_url = None
         endpoint_from_url = None
@@ -4438,6 +4493,14 @@ async def validate_request(request: Request):
             # URL-derived server_name so per-entity scoping works (the URL form
             # "skill/skills/proxy-demo" would otherwise collapse containers).
             server_name = f"{generic_proxy_kind}/{generic_entity_path}".strip("/")
+
+        if virtual_backend_server_name:
+            # Virtual-server egress backend hop: the authz + token identity is the
+            # RESOLVED backend server path (carried on the non-spoofable marker),
+            # NOT the virtual alias in the URL. This makes /validate authorize the
+            # backend request and mint the backend-bound internal token, reusing
+            # the exact registered-server /mcp-proxy seam (issue #1607).
+            server_name = virtual_backend_server_name
 
         if server_name:
             # For ANY server access, enforce scope validation (fail closed principle)

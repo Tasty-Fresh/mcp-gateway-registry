@@ -13,6 +13,7 @@ from registry.schemas.virtual_server_models import (
     UpdateVirtualServerRequest,
     VirtualServerConfig,
     VirtualServerInfo,
+    build_effective_tool_name,
 )
 
 
@@ -81,6 +82,33 @@ class TestToolMapping:
                 tool_name="",
                 backend_server_path="/github",
             )
+
+
+class TestEffectiveToolName:
+    """Tests for the backend-path auto-namespacing rule (issue #virtual-naming)."""
+
+    def test_freshguard_list_forms(self):
+        assert build_effective_tool_name("list_forms", "/freshguard") == "freshguard__list_forms"
+
+    def test_remember_that_list_tasks(self):
+        assert (
+            build_effective_tool_name("list_tasks", "/remember-that") == "remember-that__list_tasks"
+        )
+
+    def test_explicit_alias_overrides_generated_name(self):
+        assert build_effective_tool_name("list_forms", "/freshguard", alias="forms") == "forms"
+
+    def test_mapping_effective_name_uses_backend_path(self):
+        mapping = ToolMapping(tool_name="search", backend_server_path="/github")
+        assert mapping.effective_name() == "github__search"
+
+    def test_mapping_effective_name_prefers_alias(self):
+        mapping = ToolMapping(tool_name="search", alias="gh-search", backend_server_path="/github")
+        assert mapping.effective_name() == "gh-search"
+
+    def test_display_name_is_ignored_by_namespace(self):
+        # The backend DISPLAY name is irrelevant; only the registered path is used.
+        assert build_effective_tool_name("search", "/srlmn") == "srlmn__search"
 
 
 class TestToolScopeOverride:

@@ -64,6 +64,19 @@ local SUPPORTED_PROTOCOL_VERSIONS = {
 }
 local LATEST_PROTOCOL_VERSION = "2025-11-25"
 
+-- Sentinel cached as the "backend session id" for a STATELESS backend that
+-- returns no Mcp-Session-Id from initialize. A session-less backend needs no
+-- session header on subsequent calls, but caching this sentinel (instead of nil)
+-- lets callers skip the L2 lookup + re-initialize loop on every request
+-- (issue #1607). It must never be written to L2 (MongoDB) or sent as a real
+-- Mcp-Session-Id header to the backend.
+local STATELESS_BACKEND = "__stateless__"
+
+
+local function _is_stateless_session(session_id)
+    return session_id == STATELESS_BACKEND
+end
+
 
 -- Resolve the authenticated user identity for the current request.
 -- Used both when creating sessions (_handle_initialize) and when enforcing
@@ -297,7 +310,34 @@ local function _initialize_backend(backend_location)
         backend_session_id = res.header["Mcp-Session-Id"] or res.header["mcp-session-id"]
     end
 
-    return backend_session_id
+    if backend_session_id and backend_session_id ~= "" then
+        -- Activate the backend session: the MCP lifecycle expects the client to
+        -- send `notifications/initialized` (with the backend session id) after
+        -- initialize before other methods. The virtual router acks the client's
+        -- own initialized notification locally, so forward the backend-bound one
+        -- here. It is a fire-and-forget notification, so a non-2xx is logged but
+        -- not fatal (some backends ack it without enforcing it).
+        ngx.req.set_header("Mcp-Session-Id", backend_session_id)
+        local notif_body = cjson.encode({
+            jsonrpc = "2.0",
+            method = "notifications/initialized",
+        })
+        local nres = ngx.location.capture(backend_location, {
+            method = ngx.HTTP_POST,
+            body = notif_body,
+        })
+        if not nres or nres.status >= 400 then
+            ngx.log(ngx.WARN, "Backend notifications/initialized failed for ", backend_location,
+                " status=", nres and nres.status or "nil")
+        end
+        return backend_session_id
+    end
+
+    -- 200 without a Mcp-Session-Id: a legitimately stateless backend. Return the
+    -- sentinel (not nil) so callers distinguish "success, session-less" from
+    -- "initialize failed" and can cache the fact instead of re-initializing on
+    -- every subsequent call.
+    return STATELESS_BACKEND
 end
 
 
@@ -343,25 +383,46 @@ local function _get_backend_session(client_session_id, backend_location, server_
     session_id = _initialize_backend(backend_location)
 
     if session_id then
-        -- Store in L2 (MongoDB). Store the resolved owner ("anonymous" only as
-        -- a last-resort audit label; the gate rejects identity-less requests
-        -- before any backend session is created).
-        local user_id = owner or "anonymous"
-        local store_body = cjson.encode({
-            backend_session_id = session_id,
-            client_session_id = client_session_id,
-            user_id = user_id,
-            virtual_server_path = "/virtual/" .. server_id,
-        })
-        ngx.location.capture("/_internal/sessions/backend/" .. backend_path, {
-            method = ngx.HTTP_PUT,
-            body = store_body,
-        })
-        -- Populate L1 cache
-        session_cache:set(cache_key, session_id, SESSION_CACHE_TTL)
+        if _is_stateless_session(session_id) then
+            -- Stateless backend: cache the sentinel in L1 only so subsequent
+            -- calls within the TTL skip the L2 lookup + re-initialize loop. A
+            -- session-less backend has no meaningful MongoDB session record, so
+            -- the sentinel is deliberately NOT written to L2.
+            session_cache:set(cache_key, STATELESS_BACKEND, SESSION_CACHE_TTL)
+        else
+            -- Store in L2 (MongoDB). Store the resolved owner ("anonymous" only as
+            -- a last-resort audit label; the gate rejects identity-less requests
+            -- before any backend session is created).
+            local user_id = owner or "anonymous"
+            local store_body = cjson.encode({
+                backend_session_id = session_id,
+                client_session_id = client_session_id,
+                user_id = user_id,
+                virtual_server_path = "/virtual/" .. server_id,
+            })
+            ngx.location.capture("/_internal/sessions/backend/" .. backend_path, {
+                method = ngx.HTTP_PUT,
+                body = store_body,
+            })
+            -- Populate L1 cache
+            session_cache:set(cache_key, session_id, SESSION_CACHE_TTL)
+        end
     end
 
     return session_id
+end
+
+
+-- Set the Mcp-Session-Id header for a backend subrequest, given a backend session
+-- id that may be nil (no session) or the STATELESS_BACKEND sentinel (session-less
+-- backend). For a stateless backend the header is cleared rather than set to the
+-- sentinel, so the sentinel is never sent on the wire.
+local function _set_backend_session_header(session_id)
+    if session_id and not _is_stateless_session(session_id) then
+        ngx.req.set_header("Mcp-Session-Id", session_id)
+    else
+        ngx.req.set_header("Mcp-Session-Id", "")
+    end
 end
 
 
@@ -436,34 +497,32 @@ local function _fetch_backend_tools_list(backend_location, client_session_id, se
         params = {},
     })
 
-    -- Get backend session
+    -- Get or create backend session (lazy on first use). Egress backends go
+    -- through the SAME session lifecycle: mcp_proxy forwards Mcp-Session-Id
+    -- through, but does not establish it, so the virtual router owns the backend
+    -- session (initialize -> capture Mcp-Session-Id -> reuse) for both egress and
+    -- non-egress backends.
     local backend_session_id = nil
     if client_session_id then
         backend_session_id = _get_backend_session(client_session_id, backend_location, server_id)
     end
 
-    if backend_session_id then
-        ngx.req.set_header("Mcp-Session-Id", backend_session_id)
-    else
-        ngx.req.set_header("Mcp-Session-Id", "")
-    end
+    _set_backend_session_header(backend_session_id)
 
     local res = ngx.location.capture(backend_location, {
         method = ngx.HTTP_POST,
         body = req_body,
     })
 
-    -- Stale session retry
-    if res and res.status >= 400 and client_session_id and backend_session_id then
+    -- Stale session retry (skip for stateless backends, which have no real
+    -- session to invalidate)
+    if res and res.status >= 400 and client_session_id and backend_session_id
+        and not _is_stateless_session(backend_session_id) then
         ngx.log(ngx.WARN, "Backend tools/list returned ", res.status,
             " for ", backend_location, " -- retrying with fresh session")
         _invalidate_backend_session(client_session_id, backend_location)
         local new_session_id = _get_backend_session(client_session_id, backend_location, server_id)
-        if new_session_id then
-            ngx.req.set_header("Mcp-Session-Id", new_session_id)
-        else
-            ngx.req.set_header("Mcp-Session-Id", "")
-        end
+        _set_backend_session_header(new_session_id)
         res = ngx.location.capture(backend_location, {
             method = ngx.HTTP_POST,
             body = req_body,
@@ -622,34 +681,28 @@ local function _proxy_list_to_backends(method_name, result_key, mapping, client_
             params = {},
         })
 
-        -- Get backend session
+        -- Get or create backend session (lazy on first use; same lifecycle for
+        -- egress and non-egress backends -- see _proxy_to_backend).
         local backend_session_id = nil
         if client_session_id then
             backend_session_id = _get_backend_session(client_session_id, backend_loc, server_id)
         end
 
-        if backend_session_id then
-            ngx.req.set_header("Mcp-Session-Id", backend_session_id)
-        else
-            ngx.req.set_header("Mcp-Session-Id", "")
-        end
+        _set_backend_session_header(backend_session_id)
 
         local res = ngx.location.capture(backend_loc, {
             method = ngx.HTTP_POST,
             body = req_body,
         })
 
-        -- Stale session retry
-        if res and res.status >= 400 and client_session_id and backend_session_id then
+        -- Stale session retry (skip for stateless backends)
+        if res and res.status >= 400 and client_session_id and backend_session_id
+            and not _is_stateless_session(backend_session_id) then
             ngx.log(ngx.WARN, "Backend ", method_name, " returned ", res.status,
                 " for ", backend_loc, " -- retrying with fresh session")
             _invalidate_backend_session(client_session_id, backend_loc)
             local new_session_id = _get_backend_session(client_session_id, backend_loc, server_id)
-            if new_session_id then
-                ngx.req.set_header("Mcp-Session-Id", new_session_id)
-            else
-                ngx.req.set_header("Mcp-Session-Id", "")
-            end
+            _set_backend_session_header(new_session_id)
             res = ngx.location.capture(backend_loc, {
                 method = ngx.HTTP_POST,
                 body = req_body,
@@ -703,7 +756,9 @@ local function _proxy_to_backend(request_id, method_name, proxied_params,
         params = proxied_params,
     })
 
-    -- Get or create backend session
+    -- Get or create backend session (lazy on first use; same lifecycle for
+    -- egress and non-egress backends -- mcp_proxy forwards Mcp-Session-Id through
+    -- but does not establish it, so the virtual router owns it either way).
     local backend_session_id = nil
     if client_session_id then
         backend_session_id = _get_backend_session(client_session_id, backend_location, server_id)
@@ -715,11 +770,7 @@ local function _proxy_to_backend(request_id, method_name, proxied_params,
     end
 
     -- Set the backend session header for the subrequest proxy
-    if backend_session_id then
-        ngx.req.set_header("Mcp-Session-Id", backend_session_id)
-    else
-        ngx.req.set_header("Mcp-Session-Id", "")
-    end
+    _set_backend_session_header(backend_session_id)
 
     local res = ngx.location.capture(backend_location, {
         method = ngx.HTTP_POST,
@@ -734,8 +785,9 @@ local function _proxy_to_backend(request_id, method_name, proxied_params,
     end
 
     -- Stale session retry: if backend returns an error that looks like a session issue,
-    -- invalidate the session and retry once
-    if res.status >= 400 and client_session_id and backend_session_id then
+    -- invalidate the session and retry once (skip for stateless backends)
+    if res.status >= 400 and client_session_id and backend_session_id
+        and not _is_stateless_session(backend_session_id) then
         ngx.log(ngx.WARN, "Backend returned ", res.status, " for ", label or method_name,
             " session=", backend_session_id, " -- retrying with fresh session")
 
@@ -744,11 +796,7 @@ local function _proxy_to_backend(request_id, method_name, proxied_params,
 
         -- Get a fresh session (will re-initialize the backend)
         local new_session_id = _get_backend_session(client_session_id, backend_location, server_id)
-        if new_session_id then
-            ngx.req.set_header("Mcp-Session-Id", new_session_id)
-        else
-            ngx.req.set_header("Mcp-Session-Id", "")
-        end
+        _set_backend_session_header(new_session_id)
 
         -- Retry the request
         res = ngx.location.capture(backend_location, {
@@ -1274,6 +1322,11 @@ if _G._VR_TEST then
     _M._append_mapping_tools_for_backend = _append_mapping_tools_for_backend
     _M._handle_tools_list = _handle_tools_list
     _M._forward_identity_headers = _forward_identity_headers
+    _M._initialize_backend = _initialize_backend
+    _M._get_backend_session = _get_backend_session
+    _M._invalidate_backend_session = _invalidate_backend_session
+    _M._is_stateless_session = _is_stateless_session
+    _M._set_backend_session_header = _set_backend_session_header
     return _M
 end
 

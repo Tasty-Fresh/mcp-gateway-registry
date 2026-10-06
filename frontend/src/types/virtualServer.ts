@@ -22,6 +22,31 @@ export interface ToolMapping {
 
 
 /**
+ * Separator used between the backend-path namespace and the original tool name
+ * in an auto-namespaced virtual tool name. Must stay in sync with
+ * TOOL_NAMESPACE_SEPARATOR in registry/schemas/virtual_server_models.py.
+ */
+export const TOOL_NAMESPACE_SEPARATOR = '__';
+
+
+/**
+ * Compute the client-visible (effective) virtual tool name.
+ *
+ * An explicit alias always wins. Otherwise the tool is auto-namespaced from its
+ * registered backend server path (operator-controlled, short, unique, stable):
+ *   <backend path without leading "/"> + "__" + <original tool name>
+ *
+ * Mirrors build_effective_tool_name() in the backend schema.
+ */
+export function buildEffectiveToolName(mapping: ToolMapping): string {
+  if (mapping.alias) {
+    return mapping.alias;
+  }
+  return `${mapping.backend_server_path.replace(/^\/+/, '')}${TOOL_NAMESPACE_SEPARATOR}${mapping.tool_name}`;
+}
+
+
+/**
  * Per-tool scope override for fine-grained access control.
  *
  * Allows requiring additional scopes to see or call specific tools

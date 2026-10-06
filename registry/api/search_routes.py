@@ -490,13 +490,12 @@ async def _hide_blocked_virtual_tools(
     if not vs_config:
         return list(tools)
 
-    # Both the original name and the alias map to the same backend tool.
+    # The client-visible name (alias or backend-path-namespaced) maps to the
+    # backend tool.
     backend_of: dict[str, tuple[str, str]] = {}
     for tm in vs_config.tool_mappings:
         target = (tm.backend_server_path, tm.tool_name)
-        backend_of[tm.tool_name] = target
-        if tm.alias:
-            backend_of[tm.alias] = target
+        backend_of[tm.effective_name()] = target
 
     kept = []
     for tool in tools:
@@ -536,10 +535,11 @@ async def _get_tool_schema_for_virtual_server(
         if not vs_config:
             return None
 
-        # Find the tool mapping for this tool (check both tool_name and alias)
+        # Find the tool mapping for this tool by its client-visible (effective)
+        # name (alias or backend-path-namespaced).
         tool_mapping = None
         for tm in vs_config.tool_mappings:
-            if tm.tool_name == tool_name or tm.alias == tool_name:
+            if tm.effective_name() == tool_name:
                 tool_mapping = tm
                 break
 

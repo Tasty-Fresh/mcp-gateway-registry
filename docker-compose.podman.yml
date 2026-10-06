@@ -378,8 +378,8 @@ services:
       - INTERNAL_TOKEN_TTL_SECONDS=${INTERNAL_TOKEN_TTL_SECONDS:-30}
       - INTERNAL_TOKEN_LEEWAY_SECONDS=${INTERNAL_TOKEN_LEEWAY_SECONDS:-5}
     ports:
-      - "80:8080"   # Map host 80 to container 8080 (non-root nginx)
-      - "443:8443"  # Map host 443 to container 8443 (non-root nginx)
+      - "18081:8080"   # Map host 80 to container 8080 (non-root nginx)
+      - "18443:8443"  # Map host 443 to container 8443 (non-root nginx)
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -401,8 +401,6 @@ services:
     depends_on:
       auth-server:
         condition: service_started
-      metrics-service:
-        condition: service_healthy
       mongodb-init:
         condition: service_completed_successfully
       openbao:
@@ -410,55 +408,6 @@ services:
     restart: unless-stopped
 
   # Metrics Collection Service
-  metrics-service:
-    build:
-      context: metrics-service
-      dockerfile: Dockerfile
-      args:
-        BUILD_VERSION: ${BUILD_VERSION:-1.0.0}
-    environment:
-      - METRICS_SERVICE_PORT=8890
-      - METRICS_SERVICE_HOST=0.0.0.0
-      - SQLITE_DB_PATH=/var/lib/sqlite/metrics.db
-      - METRICS_RETENTION_DAYS=90
-      - METRICS_API_KEY_AUTH=${METRICS_API_KEY_AUTH_SERVER}
-      - METRICS_API_KEY_REGISTRY=${METRICS_API_KEY_REGISTRY}
-      - METRICS_API_KEY_MCPGW=${METRICS_API_KEY_MCPGW_SERVER}
-      # Per-deployment pepper for API-key hashing. Required: the metrics-service
-      # refuses to start without a strong value. Generated into .env by
-      # build_and_run.sh; rotating it invalidates existing API-key hashes.
-      - METRICS_KEY_PEPPER=${METRICS_KEY_PEPPER}
-      # Dedicated admin API key that gates /admin/* (retention/cleanup/db stats).
-      # Must be distinct from the ingest keys above; /admin/* denies by default
-      # until it is set. Do NOT set it equal to an ingest key.
-      - METRICS_ADMIN_API_KEY=${METRICS_ADMIN_API_KEY}
-      - OTEL_SERVICE_NAME=mcp-metrics-service
-      - OTEL_PROMETHEUS_ENABLED=true
-      - OTEL_PROMETHEUS_PORT=9465
-      - OTEL_OTLP_ENDPOINT=${OTEL_OTLP_ENDPOINT:-}
-      - OTEL_EXPORTER_OTLP_HEADERS=${OTEL_EXPORTER_OTLP_HEADERS:-}
-      - OTEL_OTLP_EXPORT_INTERVAL_MS=${OTEL_OTLP_EXPORT_INTERVAL_MS:-30000}
-      - OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=${OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE:-cumulative}
-      - METRICS_RATE_LIMIT=1000
-    ports:
-      # Loopback-only API port (build_and_run.sh health-checks it from the host).
-      - "${HOST_BIND_IP:-127.0.0.1}:8890:8890"
-      # 9465 (Prometheus exporter) is scraped container-to-container by Prometheus
-      # (see config/prometheus.yml job 'mcp-metrics-service' -> metrics-service:9465),
-      # so it needs no host mapping. Not published.
-    volumes:
-      - metrics-db-data:/var/lib/sqlite
-      - ${HOME}/mcp-gateway/logs:/app/logs
-    depends_on:
-      - metrics-db
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8890/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # Auth service (separate and scalable)
   auth-server:
     build:
       context: .
@@ -467,6 +416,7 @@ services:
         BUILD_VERSION: ${BUILD_VERSION:-1.0.0}
     environment:
       - REGISTRY_URL=${REGISTRY_URL}
+      - AUTH_SERVER_EXTERNAL_URL=${AUTH_SERVER_EXTERNAL_URL}
       # Request-source trust (audit client IP + OAuth external-URL host allowlist)
       - TRUSTED_PROXY_HOPS=${TRUSTED_PROXY_HOPS:-1}
       - TRUSTED_EXTERNAL_HOSTS=${TRUSTED_EXTERNAL_HOSTS:-}
@@ -623,7 +573,7 @@ services:
     ports:
       # Loopback-only: normal traffic goes through the nginx front door; direct
       # port is for host health checks / tests only.
-      - "${HOST_BIND_IP:-127.0.0.1}:8888:8888"
+      - "${HOST_BIND_IP:-127.0.0.1}:18889:8888"
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -637,8 +587,6 @@ services:
       # Application log files (bind mount to host for Splunk ingestion, Issue #987)
       - /var/log/containers/ai-registry:/var/log/containers/ai-registry
     depends_on:
-      metrics-service:
-        condition: service_healthy
       mongodb-init:
         condition: service_completed_successfully
     restart: unless-stopped
@@ -713,160 +661,6 @@ services:
 
 
   # SQLite container for metrics database
-  metrics-db:
-    # Pinned (not :latest) so rebuilds are reproducible.
-    image: alpine:3.21
-    volumes:
-      - metrics-db-data:/var/lib/sqlite
-    command: ["sh", "-c", "apk add --no-cache sqlite && mkdir -p /var/lib/sqlite && sqlite3 /var/lib/sqlite/metrics.db 'CREATE TABLE IF NOT EXISTS _health (id INTEGER);' && tail -f /dev/null"]
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "sqlite3", "/var/lib/sqlite/metrics.db", ".tables"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # Prometheus for metrics collection
-  prometheus:
-    # Pinned (not :latest) to match the main compose stack.
-    image: prom/prometheus:v3.11.3
-    ports:
-      # Loopback-only: Prometheus UI is a local-dev convenience, not a public surface.
-      - "${HOST_BIND_IP:-127.0.0.1}:9090:9090"
-    volumes:
-      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--storage.tsdb.retention.time=200h'
-      - '--web.enable-lifecycle'
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    restart: unless-stopped
-
-  # Grafana for metrics visualization
-  grafana:
-    image: grafana/grafana:12.3.1
-    ports:
-      # Loopback-only: Grafana UI is a local-dev convenience, not a public surface.
-      - "${HOST_BIND_IP:-127.0.0.1}:3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
-      - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_AUTH_ANONYMOUS_ENABLED=false
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    depends_on:
-      - prometheus
-    restart: unless-stopped
-
-  # PostgreSQL database for Keycloak
-  keycloak-db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: keycloak
-      POSTGRES_USER: keycloak
-      # No default: the Keycloak realm lives in this database, so a shipped
-      # "keycloak" password would be a usable credential. Set it in .env.
-      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?Set KEYCLOAK_DB_PASSWORD in .env}
-    volumes:
-      - keycloak_db_data:/var/lib/postgresql/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U keycloak"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # Keycloak Identity Provider
-  keycloak:
-    image: quay.io/keycloak/keycloak:25.0
-    # Realm setup is NOT done by --import-realm. The mcp-gateway realm, clients,
-    # groups, and users are created programmatically by keycloak/setup/init-keycloak.sh,
-    # which you run once after the stack is up (see docs/complete-setup-guide.md).
-    # keycloak/import/realm-config.json is not imported here (it is not compatible
-    # with stock --import-realm on this Keycloak version), so do NOT add
-    # --import-realm expecting it to work -- run init-keycloak.sh instead.
-    command: start-dev  # Use 'start' for production with proper SSL
-    environment:
-      # Database configuration
-      KC_DB: postgres
-      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
-      KC_DB_USERNAME: keycloak
-      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?Set KEYCLOAK_DB_PASSWORD in .env}
-
-      # Admin credentials. No default password: this bootstraps the Keycloak
-      # master-realm admin, so an empty/guessable value would be a full
-      # takeover of the IdP. Set KEYCLOAK_ADMIN_PASSWORD in .env.
-      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
-      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?Set KEYCLOAK_ADMIN_PASSWORD in .env}
-
-      # HTTP configuration
-      KC_HTTP_ENABLED: 'true'
-      KC_HTTP_PORT: 8080
-      KC_HOSTNAME_STRICT: 'false'
-      KC_HOSTNAME_STRICT_HTTPS: 'false'
-      KC_PROXY: edge  # Running behind nginx
-
-      # Frontend URL for external JWT issuer
-      # Podman note: host port 8080 is used by the registry UI (8080->80),
-      # so Keycloak is exposed on 18080->8080 by default in this Podman compose.
-      KC_FRONTEND_URL: ${KEYCLOAK_EXTERNAL_URL:-http://localhost:18080}
-
-      # Features
-      KC_FEATURES: token-exchange,admin-api
-
-      # Logging
-      KC_LOG_LEVEL: INFO
-
-      # Health endpoints (required for /health/ready)
-      KC_HEALTH_ENABLED: 'true'
-
-    ports:
-      # Loopback-only: Keycloak is reached through the nginx front door in normal use.
-      - "${HOST_BIND_IP:-127.0.0.1}:18080:8080"
-    depends_on:
-      keycloak-db:
-        condition: service_healthy
-    volumes:
-      - ./keycloak/themes:/opt/keycloak/themes
-      - ./keycloak/providers:/opt/keycloak/providers
-      - ./keycloak/import:/opt/keycloak/data/import
-    restart: unless-stopped
-    healthcheck:
-      # The Keycloak image deliberately ships without curl (upstream removes HTTP
-      # clients to cut attack surface), so a curl-based check can never succeed
-      # and leaves the container permanently unhealthy. Use bash's /dev/tcp
-      # redirection, which is what the Keycloak health guide documents for
-      # HEALTHCHECK. Since Keycloak 25 the health endpoints are served on the
-      # management port (9000), not on the main HTTP port.
-      test:
-        - CMD
-        - /bin/bash
-        - -c
-        - "{ printf 'HEAD /health/ready HTTP/1.0\\r\\n\\r\\n' >&0; grep 'HTTP/1.[01] 200'; } 0<>/dev/tcp/localhost/9000"
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      # First boot runs the Keycloak DB schema migration; a short start_period
-      # reports the container unhealthy during an otherwise normal startup.
-      start_period: 120s
-
   pingfederate:
     image: pingidentity/pingfederate:13.0.2
     container_name: pingfederate
@@ -968,10 +762,6 @@ services:
 
 volumes:
   ssl_data:
-  keycloak_db_data:
-  metrics-db-data:
-  prometheus-data:
-  grafana-data:
   mongodb-data:
   mongodb-config:
   pingfederate-data:
