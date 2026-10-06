@@ -55,12 +55,12 @@ class TestHelperFunctions:
         assert _get_effective_tool_name(mapping) == "github_search"
 
     def test_get_effective_tool_name_without_alias(self):
-        """Test effective name returns original when no alias."""
+        """Test effective name is backend-path-namespaced when no alias."""
         mapping = ToolMapping(
             tool_name="search",
             backend_server_path="/github",
         )
-        assert _get_effective_tool_name(mapping) == "search"
+        assert _get_effective_tool_name(mapping) == "github__search"
 
     def test_get_unique_backends(self):
         """Test extracting unique backend paths."""
@@ -117,13 +117,26 @@ class TestVirtualServerServiceValidation:
 
     @pytest.mark.asyncio
     async def test_validate_unique_tool_names_duplicate_detected(self, service):
-        """Test validation fails with duplicate tool names."""
+        """Test validation fails with duplicate effective names."""
+        mappings = [
+            ToolMapping(tool_name="search", backend_server_path="/github"),
+            ToolMapping(tool_name="search", backend_server_path="/github"),
+        ]
+        with pytest.raises(VirtualServerValidationError, match="Duplicate tool names"):
+            service._validate_unique_tool_names(mappings)
+
+    @pytest.mark.asyncio
+    async def test_validate_unique_tool_names_namespacing_resolves_cross_backend_collision(
+        self, service
+    ):
+        """The same tool name on DIFFERENT backends no longer collides: the
+        backend-path namespace makes the effective names unique."""
         mappings = [
             ToolMapping(tool_name="search", backend_server_path="/github"),
             ToolMapping(tool_name="search", backend_server_path="/jira"),
         ]
-        with pytest.raises(VirtualServerValidationError, match="Duplicate tool names"):
-            service._validate_unique_tool_names(mappings)
+        # No raise: github__search vs jira__search.
+        service._validate_unique_tool_names(mappings)
 
     @pytest.mark.asyncio
     async def test_validate_unique_tool_names_alias_resolves_conflict(self, service):
@@ -669,7 +682,7 @@ class TestToolResolution:
             ],
             tool_scope_overrides=[
                 {
-                    "tool_alias": "search",
+                    "tool_alias": "github__search",
                     "required_scopes": ["github:read"],
                 },
             ],
@@ -690,6 +703,7 @@ class TestToolResolution:
 
         assert len(tools) == 1
         assert tools[0].required_scopes == ["github:read"]
+        assert tools[0].name == "github__search"
 
     @staticmethod
     def _multi_backend_config() -> VirtualServerConfig:
@@ -756,9 +770,9 @@ class TestToolResolution:
 
         names = {t.name for t in tools}
         backends = {t.backend_server_path for t in tools}
-        assert names == {"search", "delete_repo"}
+        assert names == {"github__search", "github__delete_repo"}
         assert backends == {"/github"}
-        assert "create_issue" not in names
+        assert "jira__create_issue" not in names
 
     @pytest.mark.asyncio
     async def test_resolve_tools_filters_by_tool_allowlist(
@@ -778,7 +792,7 @@ class TestToolResolution:
 
         tools = await service.resolve_tools("/virtual/dev", user_context=user_context)
 
-        assert [t.name for t in tools] == ["search"]
+        assert [t.name for t in tools] == ["github__search"]
 
     @pytest.mark.asyncio
     async def test_resolve_tools_empty_allowlist_fails_closed(
@@ -811,7 +825,7 @@ class TestToolResolution:
                 ToolMapping(tool_name="search", backend_server_path="/github"),
             ],
             tool_scope_overrides=[
-                {"tool_alias": "search", "required_scopes": ["github:read"]},
+                {"tool_alias": "github__search", "required_scopes": ["github:read"]},
             ],
         )
         mock_server_repo.get.side_effect = self._multi_backend_docs
@@ -832,7 +846,7 @@ class TestToolResolution:
         with_scope = await service.resolve_tools(
             "/virtual/dev", user_context={**base_context, "scopes": ["github:read"]}
         )
-        assert [t.name for t in with_scope] == ["search"]
+        assert [t.name for t in with_scope] == ["github__search"]
         assert with_scope[0].required_scopes == ["github:read"]
 
 

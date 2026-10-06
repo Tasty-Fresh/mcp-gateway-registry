@@ -31,6 +31,43 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+TOOL_NAMESPACE_SEPARATOR: str = "__"
+
+
+def build_effective_tool_name(
+    tool_name: str,
+    backend_server_path: str,
+    alias: str | None = None,
+) -> str:
+    """Compute the client-visible (effective) virtual tool name.
+
+    An explicit per-tool ``alias`` always wins. Otherwise the tool is
+    auto-namespaced from its registered backend server path so tools aggregated
+    from different backend MCP servers keep obvious provenance in the flat
+    virtual namespace:
+
+        <backend path without leading "/"> + "__" + <original tool name>
+
+    The backend server path (not the display name) is the namespace source
+    because it is operator-controlled, short, unique, stable, and already tied
+    to backend routing. Examples:
+
+        backend "/freshguard"   + tool "list_forms" -> "freshguard__list_forms"
+        backend "/remember-that" + tool "list_tasks" -> "remember-that__list_tasks"
+
+    Args:
+        tool_name: Original tool name on the backend server.
+        backend_server_path: Backend server path (e.g. ``/freshguard``).
+        alias: Explicit per-tool alias, if configured.
+
+    Returns:
+        The effective tool name to expose in tools/list and accept in tools/call.
+    """
+    if alias:
+        return alias
+    return f"{backend_server_path.strip('/')}{TOOL_NAMESPACE_SEPARATOR}{tool_name}"
+
+
 class ToolMapping(BaseModel):
     """Maps a tool from a backend server into a virtual server.
 
@@ -75,6 +112,14 @@ class ToolMapping(BaseModel):
             raise ValueError("Backend server path must start with '/'")
         return v
 
+    def effective_name(self) -> str:
+        """Return the client-visible virtual tool name for this mapping.
+
+        An explicit alias wins; otherwise the name is auto-namespaced from the
+        backend server path (see :func:`build_effective_tool_name`).
+        """
+        return build_effective_tool_name(self.tool_name, self.backend_server_path, self.alias)
+
 
 class ToolScopeOverride(BaseModel):
     """Per-tool scope override for fine-grained access control.
@@ -88,7 +133,7 @@ class ToolScopeOverride(BaseModel):
     tool_alias: str = Field(
         ...,
         min_length=1,
-        description="Tool alias or original tool_name",
+        description="Tool alias or effective (backend-path-namespaced) name",
     )
     required_scopes: list[str] = Field(
         ...,
@@ -411,13 +456,16 @@ class ToolCatalogEntry(BaseModel):
 class ResolvedTool(BaseModel):
     """A tool resolved from a virtual server's tool mappings.
 
-    Contains the final tool name (alias or original), its source backend,
-    and the full tool metadata for serving in tools/list responses.
+    Contains the final tool name (alias or backend-path-namespaced), its source
+    backend, and the full tool metadata for serving in tools/list responses.
     """
 
     model_config = ConfigDict(populate_by_name=True)
 
-    name: str = Field(..., description="Tool name (alias if set, otherwise original)")
+    name: str = Field(
+        ...,
+        description="Tool name (alias if set, otherwise backend-path-namespaced)",
+    )
     original_name: str = Field(..., description="Original tool name on backend")
     backend_server_path: str = Field(..., description="Backend server path")
     backend_version: str | None = Field(None, description="Pinned version if set")

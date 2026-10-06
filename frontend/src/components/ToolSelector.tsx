@@ -7,7 +7,7 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
 } from '@heroicons/react/24/outline';
-import { ToolMapping, ToolCatalogEntry } from '../types/virtualServer';
+import { ToolMapping, ToolCatalogEntry, buildEffectiveToolName } from '../types/virtualServer';
 import { useToolCatalog } from '../hooks/useVirtualServers';
 
 
@@ -306,7 +306,7 @@ const ToolSelector: React.FC<ToolSelectorProps> = ({
                 <div className="flex items-center justify-between mb-1">
                   <div className="flex-1 min-w-0">
                     <span className="font-mono text-sm text-gray-900 dark:text-white">
-                      {mapping.alias || mapping.tool_name}
+                      {buildEffectiveToolName(mapping)}
                     </span>
                     {mapping.alias && (
                       <span className="text-xs text-gray-500 dark:text-gray-400 ml-2">
