@@ -2118,6 +2118,7 @@ async def test_generated_virtual_server_block_is_rate_limited(nginx_service):
     class _VS:
         path = "/virtual/dev-essentials"
         server_name = "Dev Essentials"
+        tool_mappings = []
 
     repo = MagicMock()
     repo.list_enabled = AsyncMock(return_value=[_VS()])

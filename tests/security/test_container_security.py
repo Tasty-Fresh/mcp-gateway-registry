@@ -254,27 +254,44 @@ def test_docker_compose_registry_port_mapping(repo_root: Path):
 # ---------------------------------------------------------------------------
 
 
-def _keycloak_healthcheck_command(compose_path: Path) -> str:
+def _keycloak_service(compose_path: Path) -> dict | None:
+    """Return the keycloak service mapping, or None if the file has no keycloak.
+
+    The rootless Podman stack (docker-compose.podman.yml) intentionally drops
+    the Keycloak service (it is a minimal rootless dev profile, not the full
+    IdP stack). The Keycloak healthcheck invariants below only apply when a
+    Keycloak service is actually present, so callers skip when this is None.
+    """
+    data = yaml.safe_load(compose_path.read_text())
+    return (data.get("services") or {}).get("keycloak")
+
+
+def _keycloak_healthcheck_command(compose_path: Path) -> str | None:
     """Return the keycloak service healthcheck command as a single string.
 
     Both the exec form (``["CMD", ...]``) and the shell form (``CMD-SHELL``)
     are flattened to one string so callers can assert on its content without
-    caring which form the file happens to use.
+    caring which form the file happens to use. Returns None when the compose
+    file has no keycloak service.
     """
-    data = yaml.safe_load(compose_path.read_text())
-    keycloak = data["services"]["keycloak"]
+    keycloak = _keycloak_service(compose_path)
+    if keycloak is None:
+        return None
     test = keycloak["healthcheck"]["test"]
     return test if isinstance(test, str) else " ".join(test)
 
 
-def _keycloak_environment(compose_path: Path) -> dict[str, str]:
+def _keycloak_environment(compose_path: Path) -> dict[str, str] | None:
     """Return the keycloak service environment as a mapping.
 
     Compose accepts both the ``KEY: value`` mapping form and the ``- KEY=value``
-    list form; normalise to a dict so assertions work against either.
+    list form; normalise to a dict so assertions work against either. Returns
+    None when the compose file has no keycloak service.
     """
-    data = yaml.safe_load(compose_path.read_text())
-    env = data["services"]["keycloak"].get("environment", {})
+    keycloak = _keycloak_service(compose_path)
+    if keycloak is None:
+        return None
+    env = keycloak.get("environment", {})
     if isinstance(env, dict):
         return {str(k): str(v) for k, v in env.items()}
     normalised = {}
@@ -295,6 +312,8 @@ def test_keycloak_healthcheck_does_not_use_curl(repo_root: Path, compose_filenam
     for a real Keycloak outage. Upstream documents a bash /dev/tcp check instead.
     """
     command = _keycloak_healthcheck_command(repo_root / compose_filename)
+    if command is None:
+        pytest.skip(f"{compose_filename}: no keycloak service to healthcheck")
     assert "curl" not in command, (
         f"{compose_filename}: keycloak healthcheck invokes curl, which is not present "
         f"in the Keycloak image; the container can never become healthy. "
@@ -311,6 +330,8 @@ def test_keycloak_healthcheck_targets_management_port(repo_root: Path, compose_f
     returns 404 even once a working HTTP client is used.
     """
     command = _keycloak_healthcheck_command(repo_root / compose_filename)
+    if command is None:
+        pytest.skip(f"{compose_filename}: no keycloak service to healthcheck")
     assert "/health/ready" in command, (
         f"{compose_filename}: keycloak healthcheck does not probe /health/ready"
     )
@@ -328,6 +349,8 @@ def test_keycloak_health_endpoints_enabled(repo_root: Path, compose_filename: st
     easy to miss once the curl problem is fixed.
     """
     env = _keycloak_environment(repo_root / compose_filename)
+    if env is None:
+        pytest.skip(f"{compose_filename}: no keycloak service to healthcheck")
     assert env.get("KC_HEALTH_ENABLED", "").lower() == "true", (
         f"{compose_filename}: keycloak is missing KC_HEALTH_ENABLED=true, so the "
         f"health endpoints are not exposed and the healthcheck cannot pass."
@@ -445,23 +468,45 @@ def test_compose_front_door_still_published(
     repo_root: Path,
     compose_filename: str,
 ):
-    """The nginx front door (80/443) must remain published on all interfaces.
+    """The nginx front door (container ports 8080/8443) must stay published on
+    all interfaces.
 
     Guards against an over-eager hardening pass that accidentally loopback-binds
-    the public entry point and breaks external access.
+    the public entry point and breaks external access. The host-side port varies
+    by compose variant: the rootful stacks publish 80:8080 / 443:8443, while the
+    rootless Podman stack publishes the non-privileged 18081:8080 / 18443:8443
+    (rootless Podman cannot bind ports <1024). The invariant is expressed on the
+    container-side nginx ports, which are identical across all variants.
     """
     compose_file = repo_root / compose_filename
-    content = compose_file.read_text()
 
-    assert "80:8080" in content, f"{compose_filename}: front-door 80:8080 mapping missing"
-    assert "443:8443" in content, f"{compose_filename}: front-door 443:8443 mapping missing"
-    # The front door must NOT carry a loopback prefix.
-    assert f"{LOOPBACK_BIND_PREFIX}80:8080" not in content, (
-        f"{compose_filename}: front-door 80:8080 must stay on all interfaces, not loopback"
+    published: dict[int, str] = {}
+    for service_name, entry in _iter_published_ports(compose_file):
+        # Only the registry service's nginx ports form the public front door; the
+        # Keycloak service (where present) also targets 8080 but is loopback-bound.
+        if service_name != "registry":
+            continue
+        if isinstance(entry, dict):
+            target = entry.get("target")
+            if target in FRONT_DOOR_TARGET_PORTS:
+                published[target] = str(entry.get("host_ip", ""))
+            continue
+
+        raw = str(entry).strip().strip('"').strip("'")
+        target = _target_port(raw)
+        if target in FRONT_DOOR_TARGET_PORTS:
+            published[target] = raw
+
+    assert set(FRONT_DOOR_TARGET_PORTS) == set(published), (
+        f"{compose_filename}: registry front-door container ports "
+        f"{sorted(FRONT_DOOR_TARGET_PORTS)} must be published, found {sorted(published)}"
     )
-    assert f"{LOOPBACK_BIND_PREFIX}443:8443" not in content, (
-        f"{compose_filename}: front-door 443:8443 must stay on all interfaces, not loopback"
-    )
+
+    for target, binding in published.items():
+        assert not binding.startswith(LOOPBACK_BIND_PREFIX), (
+            f"{compose_filename}: registry front-door container port {target} must stay on "
+            f"all interfaces, not loopback (got {binding!r})"
+        )
 
 
 @pytest.mark.parametrize("compose_filename", COMPOSE_FILES)
